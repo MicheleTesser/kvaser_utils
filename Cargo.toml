@@ -1,0 +1,25 @@
+[workspace]
+members = [
+    "crates/kvaser-api",
+    "crates/kvaser-core",
+    "crates/kvaser-tui",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://example.invalid/raceup/kvaser_utils"
+rust-version = "1.85"
+
+[workspace.dependencies]
+anyhow = "1.0"
+bindgen = "0.72"
+clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.28"
+libloading = "0.8"
+libc = "0.2"
+ratatui = "0.29"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+thiserror = "2.0"
