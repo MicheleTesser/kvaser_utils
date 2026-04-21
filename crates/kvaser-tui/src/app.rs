@@ -10,6 +10,7 @@ use anyhow::Context;
 use kvaser_core::{
     AppController, CanBitrate, CanChannel, CanDeviceMode, CanFrame, ExportProgress, ExportSummary,
     LogEventPreview, LogFileInfo, LoggerCanChannelConfig, Result as CoreResult,
+    SocketCanTunnelConfig,
 };
 
 use crate::config::AppConfig;
@@ -90,6 +91,11 @@ impl App {
         };
         app.refresh_channels();
         app.refresh_device_mode();
+        let tunnel_config = SocketCanTunnelConfig::pair("can0", "can1");
+        let _ = app
+            .controller
+            .can_mut()
+            .configure_live_tunnel(&tunnel_config);
         Ok(app)
     }
 
@@ -122,7 +128,7 @@ impl App {
         match self
             .controller
             .can()
-            .poll_live_frames(LIVE_POLL_LIMIT_PER_CHANNEL)
+            .poll_live_frames_and_tunnel(LIVE_POLL_LIMIT_PER_CHANNEL)
         {
             Ok(frames) => self.push_live_frames(frames),
             Err(error) => self.status = error.to_string(),

@@ -9,6 +9,7 @@ use kvaser_api::{
 };
 
 use crate::error::{CoreError, Result};
+use crate::socketcan::{LiveSocketCanTunnel, SocketCanTunnelConfig};
 
 pub struct AppController {
     can: CanController,
@@ -40,6 +41,7 @@ impl AppController {
 pub struct CanController {
     canlib: Arc<Canlib>,
     active: BTreeMap<u32, ActiveCanChannel>,
+    live_tunnel: Option<LiveSocketCanTunnel>,
 }
 
 impl CanController {
@@ -47,6 +49,7 @@ impl CanController {
         Self {
             canlib,
             active: BTreeMap::new(),
+            live_tunnel: None,
         }
     }
 
@@ -100,6 +103,15 @@ impl CanController {
         self.active.clear();
     }
 
+    pub fn configure_live_tunnel(&mut self, config: &SocketCanTunnelConfig) -> Result<()> {
+        self.live_tunnel = Some(LiveSocketCanTunnel::open(config)?);
+        Ok(())
+    }
+
+    pub fn disable_live_tunnel(&mut self) {
+        self.live_tunnel = None;
+    }
+
     pub fn active_channels(&self) -> Vec<(u32, CanBitrate)> {
         self.active
             .iter()
@@ -132,6 +144,21 @@ impl CanController {
         let mut frames = Vec::new();
         for active in self.active.values() {
             frames.extend(active.guard.read_available(limit_per_channel)?);
+        }
+        Ok(frames)
+    }
+
+    pub fn poll_live_frames_and_tunnel(&self, limit_per_channel: usize) -> Result<Vec<CanFrame>> {
+        let frames = self.poll_live_frames(limit_per_channel)?;
+        if let Some(tunnel) = &self.live_tunnel {
+            tunnel.send_frames(&frames)?;
+            let inbound = tunnel.receive_frames(limit_per_channel)?;
+            for frame in inbound {
+                let Some(active) = self.active.get(&frame.channel) else {
+                    continue;
+                };
+                active.guard.write_frame(&frame)?;
+            }
         }
         Ok(frames)
     }

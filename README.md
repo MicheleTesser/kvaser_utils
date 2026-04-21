@@ -1,134 +1,203 @@
 # kvaser_utils
 
-Utility Linux per Kvaser Memorator Pro 2. L'interfaccia TUI Rust resta separata dai wrapper Kvaser: la vista non parla mai direttamente con CANlib, kvmlib o kvlclib.
+Utility Linux per Kvaser Memorator Pro 2 con:
+- TUI live/logs
+- wrapper CANlib/kvmlib/kvlclib
+- tool CLI
+- bridge live bidirezionale LinuxCAN <-> SocketCAN
 
-## Stato SDK Kvaser
+## 1) Installazione
 
-Ho verificato e scaricato i pacchetti ufficiali Kvaser:
+### 1.1 Prerequisiti
 
-- `linuxcan_5_51_461.tar.gz`: driver Linux e CANlib.
-- `kvlibsdk_5_51_461.tar.gz`: kvmlib e kvlclib, necessari per leggere i log Memorator e convertirli in MF4.
+Servono:
+- Rust toolchain (`cargo`)
+- `ip` (`iproute2`)
+- `sudo`
+- Linux (progetto Linux-only)
 
-Fonti ufficiali:
+### 1.2 SDK Kvaser nel repository
 
-- CANlib WebHelp: https://kvaser.com/canlib-webhelp/
-- Linux Drivers and SDK: `https://www.kvaser.com/downloads-kvaser/?utm_source=software&utm_ean=7330130980754&utm_status=latest`
-- Linux SDK Library: `https://www.kvaser.com/downloads-kvaser/?utm_source=software&utm_ean=7330130981966&utm_status=latest`
-
-Gli archivi e le sorgenti SDK sono ignorati da git. Per riscaricarli:
+Questo repository contiene gia' gli SDK Kvaser sotto `third_party/kvaser`.
+Se vuoi riscaricarli dalla fonte ufficiale:
 
 ```bash
 scripts/download-kvaser-sdk.sh
 ```
 
-## Architettura
+### 1.3 Build librerie user-space locali
 
-- `crates/kvaser-api`: wrapper Rust runtime-loaded per `libcanlib.so`, `libkvmlib.so`, `libkvlclib.so`. Nessun codice TUI.
-- `crates/kvaser-core`: modelli e controller applicativi. Qui vive la logica MVC: CAN controller, log controller, SocketCAN Linux.
-- `crates/kvaser-tui`: vista TUI e input handling con `ratatui`/`crossterm`.
-
-## Funzioni iniziali
-
-- Elenco canali Kvaser visti da CANlib.
-- Attivazione canali CAN 0 e 1 con bitrate indipendenti, mantenendo aperti gli handle mentre la TUI resta attiva.
-- Cambio bitrate dalla TUI tra 500k e 1M.
-- Switch del Memorator tra `interface` e `logger` mode via CANlib. `logger` mode permette al device di registrare anche mentre e' collegato via USB, se la configurazione logger sul device e' valida.
-- Monitor live dei frame CAN in TUI dai canali accesi in `interface` mode.
-- Configurazione Linux SocketCAN (`can0`, `can1`, o nomi custom) con bitrate indipendenti.
-- Elenco log nel Memorator via kvmlib.
-- Preview dei primi eventi di un log.
-- Export MF4 di tutti i log selezionati via kvlclib (`KVLC_FILE_FORMAT_MDF_4X`), leggendo direttamente dal device.
-- Reset/formattazione della SD del Memorator via `kvmDeviceFormatDisk`.
-
-## Prerequisiti Linux
-
-Installa i pacchetti Kvaser seguendo i README dentro `third_party/kvaser/linuxcan` e `third_party/kvaser/kvlibsdk`. A runtime devono essere raggiungibili:
-
-- `libcanlib.so`
-- `libkvmlib.so`
-- `libkvlclib.so`
-
-Se le librerie non sono installate in un path standard:
-
-```bash
-export LD_LIBRARY_PATH=/path/to/kvaser/libs:$LD_LIBRARY_PATH
-```
-
-SocketCAN richiede il comando `ip` e permessi sufficienti per modificare le interfacce CAN.
-
-## Runtime locale senza installazione in `/usr`
-
-Per sviluppo puoi buildare le librerie user-space negli SDK scaricati:
+Compila CANlib/kvmlib/kvlclib locali:
 
 ```bash
 scripts/build-kvaser-local.sh
 ```
 
-Poi usa il wrapper che imposta `LD_LIBRARY_PATH`:
+Per eseguire il progetto con `LD_LIBRARY_PATH` gia' configurato:
 
 ```bash
 scripts/run-local.sh channels
 scripts/run-local.sh tui
-scripts/run-local.sh logs list --device-channel 0
 ```
 
-Questo risolve il caricamento di `libcanlib.so`, `libkvmlib.so` e `libkvlclib.so`. Per vedere davvero il Memorator come hardware CAN serve comunque il driver Linux Kvaser installato/caricato a livello sistema, per esempio dai target `sudo make install` o DKMS dello SDK `linuxcan`.
+In alternativa puoi caricare le env manualmente:
 
-## LinuxCAN Kvaser + SocketCAN per altri device
+```bash
+source scripts/kvaser-env.sh
+cargo run -p kvaser-tui -- channels
+```
 
-Il Memorator Pro 2xHS v2 viene preso dal driver SocketCAN del kernel `kvaser_usb` se questo e' disponibile. In quel caso `ip link` mostra `can0` e `can1` con driver `kvaser_usb_kcan`, ma `kvmlib`/CANlib Kvaser non riescono a comunicare con il logger e possono fallire con `kvmDeviceOpen` status `-37`.
+## 2) Modalita' driver Kvaser: SocketCAN o LinuxCAN
 
-Per usare LinuxCAN sul Kvaser e continuare a usare SocketCAN per gli altri adattatori:
+Hai uno switch unico (senza rebuild):
+
+```bash
+scripts/kvaser-driver-mode.sh socketcan
+scripts/kvaser-driver-mode.sh linuxcan
+scripts/kvaser-driver-mode.sh status
+```
+
+Output atteso:
+- `KVASER -> SocketCAN (kvaser_usb)`
+- `KVASER -> LinuxCAN (mhydra)`
+
+### 2.1 Modalita' LinuxCAN (mhydra)
+
+Per usare il Kvaser via LinuxCAN:
+
+```bash
+scripts/kvaser-driver-mode.sh linuxcan
+```
+
+Se devi installare i moduli LinuxCAN la prima volta:
 
 ```bash
 scripts/build-kvaser-linuxcan-modules.sh
 scripts/install-kvaser-linuxcan-mhydra.sh
 ```
 
-Lo script installa solo i moduli Kvaser necessari al Memorator Pro 2:
+### 2.2 Modalita' SocketCAN (kvaser_usb)
 
-- `kvcommon`
-- `mhydra`
+Per usare il Kvaser come interfaccia SocketCAN standard:
 
-Lo script Kvaser blacklista solo `kvaser_usb`. Non rimuove `can`, `can_raw`, `can_dev`, `gs_usb`, `peak_usb` o altri driver SocketCAN non Kvaser.
+```bash
+scripts/kvaser-driver-mode.sh socketcan
+```
 
-Limite importante: lo stesso hardware Kvaser non puo' essere controllato contemporaneamente da `kvaser_usb` SocketCAN e da LinuxCAN `mhydra`. Per il Memorator usiamo `mhydra`; per gli altri device CAN continui a usare SocketCAN.
+Script legacy equivalente:
 
-## Uso
+```bash
+scripts/disable-kvaser-linuxcan-enable-socketcan.sh
+```
 
-TUI:
+### 2.3 Interfacce `can0/can1` per tunnel live
+
+Per creare rapidamente `can0` e `can1` virtuali (`vcan`) per i tool SocketCAN:
+
+```bash
+scripts/setup-socketcan-tunnel-ifaces.sh
+```
+
+## 3) Avvio TUI
+
+Con env locale gia' impostate dal wrapper:
+
+```bash
+scripts/run-local.sh tui
+```
+
+Oppure direttamente con cargo:
 
 ```bash
 cargo run -p kvaser-tui -- tui
 ```
 
-Comandi utili:
+Tasti principali TUI:
+- `1`: tab CAN
+- `2`: tab Logs
+- `3`: tab Live
+- `r`: refresh
+- `q`: quit
+- `j/k` o frecce: navigazione
+- Globale: `s` logger mode USB, `i` interface mode
+- CAN: `b` bitrate, `a` on CAN0+CAN1, `o` on selected, `f` off selected
+- Logs: `space` select, `A` select all, `c` clear, `p` preview, `e` export
+- Live: `c` clear frames
+
+Note live tunnel:
+- Se `can0/can1` esistono, in Live il tunnel e' bidirezionale:
+  LinuxCAN -> SocketCAN e SocketCAN -> LinuxCAN sui canali 0/1.
+
+## 4) Tutti gli script disponibili
+
+- `scripts/download-kvaser-sdk.sh`: scarica archivi SDK Kvaser ufficiali
+- `scripts/build-kvaser-local.sh`: build librerie user-space locali
+- `scripts/kvaser-env.sh`: esporta `LD_LIBRARY_PATH` locale
+- `scripts/run-local.sh`: esegue `kvaser-tui` con env locale
+- `scripts/build-kvaser-linuxcan-modules.sh`: build moduli kernel LinuxCAN (`kvcommon`, `mhydra`)
+- `scripts/install-kvaser-linuxcan-mhydra.sh`: installa/attiva LinuxCAN per Kvaser
+- `scripts/setup-socketcan-tunnel-ifaces.sh`: crea/porta UP `can0`/`can1` (`vcan`)
+- `scripts/disable-kvaser-linuxcan-enable-socketcan.sh`: disattiva LinuxCAN e riattiva `kvaser_usb`
+- `scripts/kvaser-driver-mode.sh`: switch rapido `linuxcan` / `socketcan` / `status`
+
+## 5) Tutti i comandi CLI
+
+Binario:
 
 ```bash
+cargo run -p kvaser-tui -- <comando>
+```
+
+### 5.1 Generali
+
+```bash
+cargo run -p kvaser-tui -- tui [--device-channel 0]
 cargo run -p kvaser-tui -- channels
+cargo run -p kvaser-tui -- mode --channel 0 interface
+cargo run -p kvaser-tui -- mode --channel 0 logger
+```
+
+### 5.2 SocketCAN helper
+
+```bash
+cargo run -p kvaser-tui -- socketcan up --if0 can0 --bitrate0 500k --if1 can1 --bitrate1 250k
+cargo run -p kvaser-tui -- socketcan down --iface can0
+```
+
+### 5.3 Logs
+
+```bash
 cargo run -p kvaser-tui -- logs list --device-channel 0
 cargo run -p kvaser-tui -- logs preview --device-channel 0 --index 0 --limit 20
-cargo run -p kvaser-tui -- logs export --device-channel 0 --output exports/session.mf4 --logs 0,1,2
-cargo run -p kvaser-tui -- socketcan up --if0 can0 --bitrate0 500k --if1 can1 --bitrate1 250k
+cargo run -p kvaser-tui -- logs export --device-channel 0 --output exports/session.mf4 --logs 0,1,2 --overwrite true
+cargo run -p kvaser-tui -- logs reset --device-channel 0 --filesystem fat32 --reserve-mb 0 --database-mb 0 --yes
 ```
 
-Se una SD nuova risulta `kvmERR_FILE_SYSTEM_CORRUPT` (`-28`) o non formattata, puoi reinizializzarla dal logger. Il comando e' distruttivo e richiede `--yes`:
+`logs record-usb` (configura logger e registra da USB):
 
 ```bash
-scripts/run-local.sh logs reset --device-channel 0 --filesystem fat32 --yes
+cargo run -p kvaser-tui -- logs record-usb --device-channel 0 --can-channel 0 --bitrate 500k --seconds 10
+cargo run -p kvaser-tui -- logs record-usb --device-channel 0 --both --bitrate 500k --seconds 10
+cargo run -p kvaser-tui -- logs record-usb --device-channel 0 --both --bitrate 500k --seconds 10 --leave-logger
 ```
 
-Opzioni utili: `--reserve-mb` riserva spazio per file utente, `--database-mb` riserva spazio per database. I default sono `0`.
+### 5.4 DBC
 
-Tasti TUI:
+```bash
+cargo run -p kvaser-tui -- logs dbc list
+cargo run -p kvaser-tui -- logs dbc add --channel 0 --file /path/file.dbc
+cargo run -p kvaser-tui -- logs dbc remove --file /path/file.dbc
+cargo run -p kvaser-tui -- logs dbc clear-channel --channel 0
+cargo run -p kvaser-tui -- logs dbc clear
+```
 
-- `1`: canali CAN.
-- `2`: log Memorator.
-- `3`: frame CAN live.
-- `r`: refresh.
-- `q`: esci.
-- `j/k` o frecce: muovi selezione.
-- Globale: `s` mette il Memorator in `logger` mode USB, `i` torna in `interface` mode.
-- CAN: `b` cambia bitrate del canale selezionato tra 500k e 1M, `a` attiva CAN 0 e CAN 1, `o` attiva il selezionato, `f` spegne il selezionato.
-- Log: `spazio` seleziona/deseleziona, `A` seleziona tutti, `c` pulisce selezione, `p` preview, `e` export MF4 dei selezionati.
-- Live: `c` pulisce i frame visualizzati. I frame arrivano solo dai canali accesi in `interface` mode.
+## 6) Troubleshooting rapido
+
+- Se cambi driver e non vedi subito i canali: scollega/ricollega il Kvaser.
+- Verifica modalita' corrente:
+
+```bash
+scripts/kvaser-driver-mode.sh status
+```
+
+- Se usi TUI live con tunnel e vuoi tool SocketCAN locali (`candump`, `cansend`), assicurati che `can0/can1` esistano (`setup-socketcan-tunnel-ifaces.sh`).

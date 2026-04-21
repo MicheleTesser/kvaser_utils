@@ -1,8 +1,5 @@
 /target/
 /exports/
-
-# Kvaser SDK archives/sources are downloaded locally. Keep the repo small and
-# let scripts/download-kvaser-sdk.sh reproduce them.
-/third_party/kvaser/*.tar.gz
+/Cargo.lock
 /third_party/kvaser/linuxcan/
 /third_party/kvaser/kvlibsdk/

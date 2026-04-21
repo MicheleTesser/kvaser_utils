@@ -52,6 +52,7 @@ type CanOpenChannel = unsafe extern "C" fn(i32, i32) -> CanHandle;
 type CanClose = unsafe extern "C" fn(CanHandle) -> CanStatus;
 type CanBusOn = unsafe extern "C" fn(CanHandle) -> CanStatus;
 type CanBusOff = unsafe extern "C" fn(CanHandle) -> CanStatus;
+type CanWrite = unsafe extern "C" fn(CanHandle, c_long, *const c_void, c_uint, c_uint) -> CanStatus;
 type CanRead = unsafe extern "C" fn(
     CanHandle,
     *mut c_long,
@@ -275,6 +276,7 @@ pub struct Canlib {
     can_close: CanClose,
     can_bus_on: CanBusOn,
     can_bus_off: CanBusOff,
+    can_write: CanWrite,
     can_read: CanRead,
     can_set_bus_params: CanSetBusParams,
     can_set_bus_output_control: CanSetBusOutputControl,
@@ -298,6 +300,7 @@ impl Canlib {
         let can_close = unsafe { load_symbol(&library, library_name, "canClose")? };
         let can_bus_on = unsafe { load_symbol(&library, library_name, "canBusOn")? };
         let can_bus_off = unsafe { load_symbol(&library, library_name, "canBusOff")? };
+        let can_write = unsafe { load_symbol(&library, library_name, "canWrite")? };
         let can_read = unsafe { load_symbol(&library, library_name, "canRead")? };
         let can_set_bus_params = unsafe { load_symbol(&library, library_name, "canSetBusParams")? };
         let can_set_bus_output_control =
@@ -319,6 +322,7 @@ impl Canlib {
             can_close,
             can_bus_on,
             can_bus_off,
+            can_write,
             can_read,
             can_set_bus_params,
             can_set_bus_output_control,
@@ -555,6 +559,22 @@ impl CanHandleGuard {
             }
         }
         Ok(frames)
+    }
+
+    pub fn write_frame(&self, frame: &CanFrame) -> Result<()> {
+        let len = frame.data.len().min(64);
+        let mut data = [0_u8; 64];
+        data[..len].copy_from_slice(&frame.data[..len]);
+        let status = unsafe {
+            (self.api.can_write)(
+                self.handle,
+                frame.id as c_long,
+                data.as_ptr().cast::<c_void>(),
+                len as c_uint,
+                frame.flags as c_uint,
+            )
+        };
+        self.api.ensure_status("canWrite", status)
     }
 }
 

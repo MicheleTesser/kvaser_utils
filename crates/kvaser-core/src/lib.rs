@@ -9,4 +9,6 @@ pub use kvaser_api::{
     LogEventKind, LogEventPreview, LogFileInfo, LogFileType, LoggerCanChannelConfig,
     LoggerConfigSummary, MemoratorFileSystem,
 };
-pub use socketcan::{SocketCanConfig, SocketCanController};
+pub use socketcan::{
+    LiveSocketCanTunnel, SocketCanConfig, SocketCanController, SocketCanTunnelConfig,
+};
