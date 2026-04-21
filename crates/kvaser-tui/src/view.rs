@@ -231,7 +231,7 @@ fn draw_commands(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Line::from("CAN: b bitrate 500k/1M | a on CAN0+CAN1 | o on selected | f off | D picker DBC CAN1+CAN2 | j/k move")
         }
         Tab::Logs => {
-            Line::from("Logs: v start-range (->) | space toggle/apply-range | A all | c clear | p preview | e export MF4 | D picker DBC CAN1+CAN2 | j/k move")
+            Line::from("Logs: v start-range (->) | space toggle/apply-range | A all | g export day | c clear | p preview | e export MF4 | D picker DBC CAN1+CAN2 | j/k move")
         }
         Tab::Live => Line::from("Live: c clear | usa 1 CAN per accendere canali e settare bitrate"),
     });

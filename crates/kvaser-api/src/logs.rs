@@ -1,4 +1,6 @@
 use std::ffi::{CString, c_void};
+use std::fs::OpenOptions;
+use std::os::fd::AsRawFd;
 use std::os::raw::{c_char, c_long, c_uint};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -44,7 +46,11 @@ const KVLC_ERR_PARAM: i32 = -2;
 const KVLC_ERR_DECREASING_TIME: i32 = -32;
 const KVLC_FILE_FORMAT_MEMO_LOG: i32 = 6;
 const KVLC_FILE_FORMAT_MDF_4X: i32 = 107;
+const KVLC_FILE_FORMAT_MDF_4X_SIGNAL: i32 = 108;
+const KVLC_PROPERTY_START_OF_MEASUREMENT: u32 = 1;
+const KVLC_PROPERTY_CREATION_DATE: u32 = 27;
 const KVLC_PROPERTY_OVERWRITE: u32 = 28;
+const KVLC_PROPERTY_SIGNAL_BASED: u32 = 1001;
 
 const KVADB_OK: i32 = 0;
 const KVAXML_OK: i32 = 0;
@@ -85,11 +91,11 @@ type KvlcConvertEvent = unsafe extern "C" fn(KvlcHandle) -> KvlcStatus;
 type KvlcSetProperty = unsafe extern "C" fn(KvlcHandle, u32, *mut c_void, u32) -> KvlcStatus;
 type KvlcEventCountEx = unsafe extern "C" fn(KvlcHandle, *mut i64) -> KvlcStatus;
 type KvlcGetOutputFilename = unsafe extern "C" fn(KvlcHandle, *mut c_char, i32) -> KvlcStatus;
-type KvlcAttachFile = unsafe extern "C" fn(KvlcHandle, *const c_char) -> KvlcStatus;
 type KvlcAddDatabaseFile = unsafe extern "C" fn(KvlcHandle, *const c_char, c_uint) -> KvlcStatus;
 type KvlcAddDatabase = unsafe extern "C" fn(KvlcHandle, KvaDbHnd, c_uint) -> KvlcStatus;
 
 type KvaDbOpen = unsafe extern "C" fn(*mut KvaDbHnd) -> KvaDbStatus;
+type KvaDbCreate = unsafe extern "C" fn(KvaDbHnd, *const c_char, *const c_char) -> KvaDbStatus;
 type KvaDbReadFile = unsafe extern "C" fn(KvaDbHnd, *const c_char) -> KvaDbStatus;
 type KvaDbClose = unsafe extern "C" fn(KvaDbHnd) -> KvaDbStatus;
 type KvaDbGetErrorText = unsafe extern "C" fn(KvaDbStatus, *mut c_char, usize) -> KvaDbStatus;
@@ -210,8 +216,8 @@ pub struct DbcBinding {
 
 #[derive(Debug, Clone, Copy)]
 pub struct ExportProgress {
-    pub completed_logs: usize,
-    pub total_logs: usize,
+    pub completed_events: u64,
+    pub total_events: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -451,22 +457,38 @@ impl MemoratorDevice {
         }
 
         let export_order = self.resolve_export_order(selected_logs)?;
+        let export_total_events = export_order
+            .iter()
+            .copied()
+            .filter_map(|index| self.read_log_info(index).ok())
+            .map(|info| info.event_count.max(0) as u64)
+            .sum::<u64>();
+        let export_reference_time = export_order
+            .first()
+            .copied()
+            .and_then(|index| self.read_log_info(index).ok())
+            .and_then(|info| info.start_time_utc.or(info.end_time_utc));
         let mut part = 1_u32;
         let mut part_path = output_part_path(output, part);
-        let mut converter = self.create_export_converter(&part_path, overwrite, dbc_files)?;
+        let mut converter = self.create_export_converter(
+            &part_path,
+            overwrite,
+            dbc_files,
+            export_reference_time,
+        )?;
         let mut first_output_path: Option<PathBuf> = None;
 
         let mut total_events = 0_u64;
         let mut skipped_events = 0_u64;
+        let mut completed_source_events = 0_u64;
         let mut last_timestamp_in_part: Option<i64> = None;
-        let total_logs = export_order.len();
 
         on_progress(ExportProgress {
-            completed_logs: 0,
-            total_logs,
+            completed_events: 0,
+            total_events: export_total_events,
         });
 
-        for (position, index) in export_order.iter().copied().enumerate() {
+        for index in export_order.iter().copied() {
             let first_ts = self.first_event_timestamp(index)?;
             if let (Some(prev), Some(next_first)) = (last_timestamp_in_part, first_ts) {
                 if next_first < prev {
@@ -476,7 +498,12 @@ impl MemoratorDevice {
                     }
                     part += 1;
                     part_path = output_part_path(output, part);
-                    converter = self.create_export_converter(&part_path, true, dbc_files)?;
+                    converter = self.create_export_converter(
+                        &part_path,
+                        true,
+                        dbc_files,
+                        export_reference_time,
+                    )?;
                     last_timestamp_in_part = None;
                 }
             }
@@ -518,9 +545,10 @@ impl MemoratorDevice {
             }
             // Keep a single continuous stream across selected logs so MDF viewers
             // don't split data into per-file channel groups.
+            completed_source_events = completed_source_events.saturating_add(_mounted.event_count.max(0) as u64);
             on_progress(ExportProgress {
-                completed_logs: position + 1,
-                total_logs,
+                completed_events: completed_source_events.min(export_total_events),
+                total_events: export_total_events,
             });
         }
         let output_path = {
@@ -575,18 +603,73 @@ impl MemoratorDevice {
         output: &Path,
         overwrite: bool,
         dbc_files: &[DbcBinding],
+        reference_unix_time: Option<u32>,
     ) -> Result<Converter> {
-        let mut converter = self
+        let mut converter = match self
             .kvlclib
-            .create_converter(output, KVLC_FILE_FORMAT_MDF_4X)?;
+            .create_converter(output, KVLC_FILE_FORMAT_MDF_4X_SIGNAL)
+        {
+            Ok(converter) => converter,
+            Err(error)
+                if is_kvlc_parameter_error(&error, "kvlcCreateConverter")
+                    || is_kvlc_not_implemented_error(&error, "kvlcCreateConverter") =>
+            {
+                self.kvlclib
+                    .create_converter(output, KVLC_FILE_FORMAT_MDF_4X)?
+            }
+            Err(error) => return Err(error),
+        };
         if overwrite {
             converter.set_overwrite(true)?;
         }
-        for dbc in dbc_files {
-            // On Linux SDK builds we have seen noisy parser warnings for many valid
-            // DBC variants ("Unrecognized keyword"). To keep TUI export stable and
-            // readable, skip runtime database parsing in MF4 conversion.
-            converter.attach_file(&dbc.path)?;
+        // Keep absolute MF4 timestamps anchored to logger wall clock.
+        let _ = converter.set_start_of_measurement(true);
+        if let Some(unix_time) = reference_unix_time {
+            let _ = converter.set_creation_date(unix_time as i64);
+        }
+        // Some SDK builds still require this property even when output format is
+        // MDF_4X_SIGNAL. Ignore unsupported status and continue.
+        let _ = converter.set_signal_based(true);
+        let mut ordered_dbc = dbc_files.to_vec();
+        ordered_dbc.sort_by(|a, b| {
+            a.channel_mask
+                .cmp(&b.channel_mask)
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        for dbc in &ordered_dbc {
+            let mut added = false;
+
+            if let Some(kvadblib) = self.kvadblib.clone() {
+                match with_silenced_stdio(|| kvadblib.open_database_file(&dbc.path)) {
+                    Ok(db_handle) => {
+                        match converter.add_database_handle(db_handle, dbc.channel_mask) {
+                            Ok(()) => {
+                                converter.track_database_handle(kvadblib, db_handle);
+                                added = true;
+                            }
+                            Err(error)
+                                if is_kvlc_not_implemented_error(&error, "kvlcAddDatabase") =>
+                            {
+                                kvadblib.close_database_handle(db_handle);
+                            }
+                            Err(error) => {
+                                kvadblib.close_database_handle(db_handle);
+                                return Err(error);
+                            }
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+
+            if !added {
+                let _ = with_silenced_stdio(|| {
+                    converter.add_database_file(&dbc.path, dbc.channel_mask)
+                })?;
+            }
+
+            // Do not attach raw DBC files to the converter metadata: some Linux
+            // SDK builds print parser warnings directly to terminal.
         }
         converter.feed_select_format(KVLC_FILE_FORMAT_MEMO_LOG)?;
         Ok(converter)
@@ -835,7 +918,6 @@ struct Kvlclib {
     kvlc_set_property: KvlcSetProperty,
     kvlc_event_count_ex: KvlcEventCountEx,
     kvlc_get_output_filename: KvlcGetOutputFilename,
-    kvlc_attach_file: Option<KvlcAttachFile>,
     kvlc_add_database_file: Option<KvlcAddDatabaseFile>,
     kvlc_add_database: Option<KvlcAddDatabase>,
 }
@@ -861,12 +943,6 @@ impl Kvlclib {
             unsafe { load_symbol(&library, library_name, "kvlcEventCountEx")? };
         let kvlc_get_output_filename =
             unsafe { load_symbol(&library, library_name, "kvlcGetOutputFilename")? };
-        let kvlc_attach_file = unsafe {
-            library
-                .get::<KvlcAttachFile>(b"kvlcAttachFile")
-                .ok()
-                .map(|symbol| *symbol)
-        };
         let kvlc_add_database_file = unsafe {
             library
                 .get::<KvlcAddDatabaseFile>(b"kvlcAddDatabaseFile")
@@ -891,7 +967,6 @@ impl Kvlclib {
             kvlc_set_property,
             kvlc_event_count_ex,
             kvlc_get_output_filename,
-            kvlc_attach_file,
             kvlc_add_database_file,
             kvlc_add_database,
         }))
@@ -947,13 +1022,42 @@ struct Converter {
 
 impl Converter {
     fn set_overwrite(&self, overwrite: bool) -> Result<()> {
-        let mut value = i32::from(overwrite);
+        self.set_property_i32(KVLC_PROPERTY_OVERWRITE, i32::from(overwrite))
+    }
+
+    fn set_signal_based(&self, enabled: bool) -> Result<()> {
+        self.set_property_i32(KVLC_PROPERTY_SIGNAL_BASED, i32::from(enabled))
+    }
+
+    fn set_start_of_measurement(&self, enabled: bool) -> Result<()> {
+        self.set_property_i32(KVLC_PROPERTY_START_OF_MEASUREMENT, i32::from(enabled))
+    }
+
+    fn set_creation_date(&self, unix_time: i64) -> Result<()> {
+        self.set_property_i64(KVLC_PROPERTY_CREATION_DATE, unix_time)
+    }
+
+    fn set_property_i32(&self, property: u32, value: i32) -> Result<()> {
+        let mut value = value;
         let status = unsafe {
             (self.api.kvlc_set_property)(
                 self.handle,
-                KVLC_PROPERTY_OVERWRITE,
+                property,
                 (&mut value as *mut i32).cast::<c_void>(),
                 std::mem::size_of::<i32>() as u32,
+            )
+        };
+        self.api.ensure_status("kvlcSetProperty", status)
+    }
+
+    fn set_property_i64(&self, property: u32, value: i64) -> Result<()> {
+        let mut value = value;
+        let status = unsafe {
+            (self.api.kvlc_set_property)(
+                self.handle,
+                property,
+                (&mut value as *mut i64).cast::<c_void>(),
+                std::mem::size_of::<i64>() as u32,
             )
         };
         self.api.ensure_status("kvlcSetProperty", status)
@@ -989,18 +1093,6 @@ impl Converter {
 
     fn track_database_handle(&mut self, api: Arc<Kvadblib>, db_handle: KvaDbHnd) {
         self.db_handles.push((api, db_handle));
-    }
-
-    fn attach_file(&self, file: &Path) -> Result<()> {
-        let Some(callback) = self.api.kvlc_attach_file else {
-            return Ok(());
-        };
-        let file = CString::new(file.as_os_str().as_bytes())?;
-        let status = unsafe { callback(self.handle, file.as_ptr()) };
-        if status == KVLC_ERR_NOT_IMPLEMENTED {
-            return Ok(());
-        }
-        self.api.ensure_status("kvlcAttachFile", status)
     }
 
     fn feed_event_memo(&self, event: &mut MemoLogEventEx) -> Result<()> {
@@ -1071,6 +1163,7 @@ impl Converter {
 struct Kvadblib {
     _library: Library,
     kva_db_open: KvaDbOpen,
+    kva_db_create: Option<KvaDbCreate>,
     kva_db_read_file: KvaDbReadFile,
     kva_db_close: KvaDbClose,
     kva_db_get_error_text: KvaDbGetErrorText,
@@ -1084,6 +1177,12 @@ impl Kvadblib {
     fn load() -> Result<Arc<Self>> {
         let (library, library_name) = load_library(KVADBLIB_LABEL, KVADBLIB_CANDIDATES)?;
         let kva_db_open = unsafe { load_symbol(&library, library_name, "kvaDbOpen")? };
+        let kva_db_create = unsafe {
+            library
+                .get::<KvaDbCreate>(b"kvaDbCreate")
+                .ok()
+                .map(|symbol| *symbol)
+        };
         let kva_db_read_file = unsafe { load_symbol(&library, library_name, "kvaDbReadFile")? };
         let kva_db_close = unsafe { load_symbol(&library, library_name, "kvaDbClose")? };
         let kva_db_get_error_text =
@@ -1092,6 +1191,7 @@ impl Kvadblib {
         Ok(Arc::new(Self {
             _library: library,
             kva_db_open,
+            kva_db_create,
             kva_db_read_file,
             kva_db_close,
             kva_db_get_error_text,
@@ -1104,10 +1204,24 @@ impl Kvadblib {
         self.ensure_status("kvaDbOpen", status)?;
 
         let file = CString::new(path.as_os_str().as_bytes())?;
-        let status = unsafe { (self.kva_db_read_file)(handle, file.as_ptr()) };
+        let status = if let Some(kva_db_create) = self.kva_db_create {
+            let local_name = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("dbc");
+            let local_name = CString::new(local_name)?;
+            unsafe { kva_db_create(handle, local_name.as_ptr(), file.as_ptr()) }
+        } else {
+            unsafe { (self.kva_db_read_file)(handle, file.as_ptr()) }
+        };
         if status != KVADB_OK {
             self.close_database_handle(handle);
-            return Err(self.status_error("kvaDbReadFile", status));
+            let op = if self.kva_db_create.is_some() {
+                "kvaDbCreate"
+            } else {
+                "kvaDbReadFile"
+            };
+            return Err(self.status_error(op, status));
         }
         Ok(handle)
     }
@@ -1417,7 +1531,10 @@ impl KvmLogEventEx {
     }
 
     fn is_supported_for_export(&self) -> bool {
-        matches!(self.type_, KVM_LOG_TYPE_MSG | KVM_LOG_TYPE_LINMSG)
+        matches!(
+            self.type_,
+            KVM_LOG_TYPE_MSG | KVM_LOG_TYPE_LINMSG | KVM_LOG_TYPE_CLOCK
+        )
     }
 
     fn timestamp_ns_for_export(&self) -> Option<i64> {
@@ -1534,6 +1651,53 @@ fn write_u32(raw: &mut [u8; 128], offset: usize, value: u32) {
     raw[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
 }
 
+unsafe extern "C" {
+    fn dup(fd: i32) -> i32;
+    fn dup2(oldfd: i32, newfd: i32) -> i32;
+    fn close(fd: i32) -> i32;
+}
+
+fn with_silenced_stdio<T>(action: impl FnOnce() -> Result<T>) -> Result<T> {
+    const STDOUT_FD: i32 = 1;
+    const STDERR_FD: i32 = 2;
+
+    let saved_out = unsafe { dup(STDOUT_FD) };
+    let saved_err = unsafe { dup(STDERR_FD) };
+    if saved_out < 0 || saved_err < 0 {
+        if saved_out >= 0 {
+            let _ = unsafe { close(saved_out) };
+        }
+        if saved_err >= 0 {
+            let _ = unsafe { close(saved_err) };
+        }
+        return action();
+    }
+
+    let devnull = match OpenOptions::new().write(true).open("/dev/null") {
+        Ok(file) => file,
+        Err(_) => {
+            let _ = unsafe { close(saved_out) };
+            let _ = unsafe { close(saved_err) };
+            return action();
+        }
+    };
+
+    if unsafe { dup2(devnull.as_raw_fd(), STDOUT_FD) } < 0
+        || unsafe { dup2(devnull.as_raw_fd(), STDERR_FD) } < 0
+    {
+        let _ = unsafe { close(saved_out) };
+        let _ = unsafe { close(saved_err) };
+        return action();
+    }
+
+    let result = action();
+    let _ = unsafe { dup2(saved_out, STDOUT_FD) };
+    let _ = unsafe { dup2(saved_err, STDERR_FD) };
+    let _ = unsafe { close(saved_out) };
+    let _ = unsafe { close(saved_err) };
+    result
+}
+
 fn is_kvlc_parameter_error(error: &KvaserError, operation: &'static str) -> bool {
     matches!(
         error,
@@ -1555,6 +1719,18 @@ fn is_kvlc_decreasing_time_error(error: &KvaserError, operation: &'static str) -
             code,
             ..
         } if *library == KVLCLIB_LABEL && *op == operation && *code == KVLC_ERR_DECREASING_TIME
+    )
+}
+
+fn is_kvlc_not_implemented_error(error: &KvaserError, operation: &'static str) -> bool {
+    matches!(
+        error,
+        KvaserError::Status {
+            library,
+            operation: op,
+            code,
+            ..
+        } if *library == KVLCLIB_LABEL && *op == operation && *code == KVLC_ERR_NOT_IMPLEMENTED
     )
 }
 

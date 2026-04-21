@@ -367,6 +367,41 @@ impl App {
         self.status = format!("{} selected log(s)", self.selected_logs.len());
     }
 
+    pub fn select_logs_same_day(&mut self) {
+        let Some(selected) = self.logs.get(self.selected_log) else {
+            return;
+        };
+        let Some(anchor_ts) = selected.start_time_utc.or(selected.end_time_utc) else {
+            self.status = "log selezionato senza timestamp".to_owned();
+            return;
+        };
+        let Some(anchor_day) = local_day_key(anchor_ts) else {
+            self.status = "impossibile determinare il giorno locale del log".to_owned();
+            return;
+        };
+
+        self.selected_logs.clear();
+        for file in &self.logs {
+            if let Some(ts) = file.start_time_utc.or(file.end_time_utc) {
+                if local_day_key(ts) == Some(anchor_day) {
+                    self.selected_logs.insert(file.index);
+                }
+            }
+        }
+        self.status = format!(
+            "{} selected log(s) for current day",
+            self.selected_logs.len()
+        );
+    }
+
+    pub fn export_logs_same_day(&mut self) {
+        self.select_logs_same_day();
+        if self.selected_logs.is_empty() {
+            return;
+        }
+        self.export_selected_logs();
+    }
+
     pub fn clear_log_selection(&mut self) {
         self.selected_logs.clear();
         self.range_anchor = None;
@@ -445,8 +480,11 @@ impl App {
         let logs: Vec<u32> = files_to_export.iter().map(|file| file.index).collect();
         self.export_pending_keys = files_to_export.iter().map(manifest_key).collect();
         let output = export_path(&files_to_export);
-        let total = logs.len();
-        self.status = format!("exporting {total} logs (0%)");
+        let total_events: u64 = files_to_export
+            .iter()
+            .map(|file| file.event_count.max(0) as u64)
+            .sum();
+        self.status = format!("exporting 0/{total_events} events (0%)");
 
         let device_channel = self.device_channel;
         let (tx, rx) = mpsc::channel();
@@ -621,18 +659,21 @@ fn next_bitrate(current: CanBitrate) -> CanBitrate {
 }
 
 fn format_export_progress(progress: ExportProgress) -> String {
-    if progress.total_logs == 0 {
-        return "exporting 0 logs (0%)".to_owned();
+    if progress.total_events == 0 {
+        return "exporting 0/0 events (0%)".to_owned();
     }
-    let pct = (progress.completed_logs * 100) / progress.total_logs;
-    format!("exporting {} logs ({}%)", progress.total_logs, pct)
+    let pct = ((progress.completed_events.saturating_mul(100)) / progress.total_events).min(100);
+    format!(
+        "exporting {}/{} events ({}%)",
+        progress.completed_events, progress.total_events, pct
+    )
 }
 
 fn export_path(files: &[LogFileInfo]) -> PathBuf {
     let stamp = files
         .iter()
-        .filter_map(|file| file.end_time_utc.or(file.start_time_utc))
-        .max()
+        .filter_map(|file| file.start_time_utc.or(file.end_time_utc))
+        .min()
         .unwrap_or_else(current_unix_seconds_u32);
 
     let base = export_base_name(stamp);
@@ -681,6 +722,28 @@ fn current_unix_seconds_u32() -> u32 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs() as u32)
         .unwrap_or_default()
+}
+
+fn local_day_key(unix_ts: u32) -> Option<(i32, i32)> {
+    let mut tm = libc::tm {
+        tm_sec: 0,
+        tm_min: 0,
+        tm_hour: 0,
+        tm_mday: 0,
+        tm_mon: 0,
+        tm_year: 0,
+        tm_wday: 0,
+        tm_yday: 0,
+        tm_isdst: 0,
+        tm_gmtoff: 0,
+        tm_zone: std::ptr::null(),
+    };
+    let seconds = unix_ts as libc::time_t;
+    let result = unsafe { libc::localtime_r(&seconds, &mut tm) };
+    if result.is_null() {
+        return None;
+    }
+    Some((tm.tm_year, tm.tm_yday))
 }
 
 fn manifest_path() -> PathBuf {

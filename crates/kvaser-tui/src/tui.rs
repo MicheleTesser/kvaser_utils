@@ -81,6 +81,7 @@ fn run_loop(terminal: &mut TuiTerminal, app: &mut App) -> anyhow::Result<()> {
                     KeyCode::Char('v') if app.tab == Tab::Logs => app.start_range_selection(),
                     KeyCode::Char(' ') if app.tab == Tab::Logs => app.toggle_selected_log(),
                     KeyCode::Char('A') if app.tab == Tab::Logs => app.select_all_logs(),
+                    KeyCode::Char('g') if app.tab == Tab::Logs => app.export_logs_same_day(),
                     KeyCode::Char('c') if app.tab == Tab::Logs => app.clear_log_selection(),
                     KeyCode::Char('p') if app.tab == Tab::Logs => app.preview_selected_log(),
                     KeyCode::Char('e') if app.tab == Tab::Logs => app.export_selected_logs(),

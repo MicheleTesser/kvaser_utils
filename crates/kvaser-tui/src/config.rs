@@ -54,6 +54,8 @@ impl AppConfig {
     pub fn bindings(&self) -> Vec<DbcBinding> {
         let mut bindings = Vec::new();
         for (channel, files) in &self.dbc_by_channel {
+            // kvlclib channel masks are bit-based from channel index 0:
+            // CAN1(channel 0) => 1<<0, CAN2(channel 1) => 1<<1.
             let mask = 1_u32.checked_shl(*channel).unwrap_or(0);
             if mask == 0 {
                 continue;
