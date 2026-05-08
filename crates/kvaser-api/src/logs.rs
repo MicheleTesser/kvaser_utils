@@ -204,6 +204,7 @@ pub struct LogEventPreview {
 #[derive(Debug, Clone)]
 pub struct ExportSummary {
     pub output: PathBuf,
+    pub outputs: Vec<PathBuf>,
     pub files: Vec<u32>,
     pub events: u64,
 }
@@ -457,26 +458,27 @@ impl MemoratorDevice {
         }
 
         let export_order = self.resolve_export_order(selected_logs)?;
-        let export_total_events = export_order
+        let export_infos: Vec<LogFileInfo> = export_order
             .iter()
             .copied()
             .filter_map(|index| self.read_log_info(index).ok())
+            .collect();
+        let export_total_events = export_infos
+            .iter()
             .map(|info| info.event_count.max(0) as u64)
             .sum::<u64>();
-        let export_reference_time = export_order
+        let export_reference_time = export_infos
             .first()
-            .copied()
-            .and_then(|index| self.read_log_info(index).ok())
             .and_then(|info| info.start_time_utc.or(info.end_time_utc));
         let mut part = 1_u32;
-        let mut part_path = output_part_path(output, part);
+        let mut part_path = output_path_for_segment(output, export_reference_time, part, &[]);
         let mut converter = self.create_export_converter(
             &part_path,
             overwrite,
             dbc_files,
             export_reference_time,
         )?;
-        let mut first_output_path: Option<PathBuf> = None;
+        let mut outputs = Vec::new();
 
         let mut total_events = 0_u64;
         let mut skipped_events = 0_u64;
@@ -488,21 +490,24 @@ impl MemoratorDevice {
             total_events: export_total_events,
         });
 
-        for index in export_order.iter().copied() {
+        for (position, index) in export_order.iter().copied().enumerate() {
+            let info = export_infos
+                .get(position)
+                .ok_or_else(|| KvaserError::Config(format!("missing log info for export index {index}")))?;
             let first_ts = self.first_event_timestamp(index)?;
             if let (Some(prev), Some(next_first)) = (last_timestamp_in_part, first_ts) {
                 if next_first < prev {
                     let finalized = finalize_converter(converter, &part_path)?;
-                    if first_output_path.is_none() {
-                        first_output_path = Some(finalized);
-                    }
+                    outputs.push(finalized);
                     part += 1;
-                    part_path = output_part_path(output, part);
+                    let segment_reference_time = info.start_time_utc.or(info.end_time_utc);
+                    part_path =
+                        output_path_for_segment(output, segment_reference_time, part, &outputs);
                     converter = self.create_export_converter(
                         &part_path,
                         true,
                         dbc_files,
-                        export_reference_time,
+                        segment_reference_time.or(export_reference_time),
                     )?;
                     last_timestamp_in_part = None;
                 }
@@ -551,10 +556,11 @@ impl MemoratorDevice {
                 total_events: export_total_events,
             });
         }
-        let output_path = {
-            let finalized = finalize_converter(converter, &part_path)?;
-            first_output_path.unwrap_or(finalized)
-        };
+        outputs.push(finalize_converter(converter, &part_path)?);
+        let output_path = outputs
+            .first()
+            .cloned()
+            .unwrap_or_else(|| part_path.clone());
         let converted_events = total_events as i64;
         if !output_path.is_file() {
             return Err(KvaserError::Config(format!(
@@ -565,6 +571,7 @@ impl MemoratorDevice {
 
         Ok(ExportSummary {
             output: output_path,
+            outputs,
             files: export_order,
             events: total_events,
         })
@@ -1449,7 +1456,7 @@ fn build_log_all_xml(channels: &[LoggerCanChannelConfig]) -> Result<String> {
 
         let (tseg1, tseg2, sjw) = logger_timing(channel.bitrate)?;
         can_bus.push_str(&format!(
-            r#"    <PARAMETERS channel="{channel}" bitrate="{bitrate}" tseg1="{tseg1}" tseg2="{tseg2}" sjw="{sjw}" silent="NO"/>"#,
+            r#"    <PARAMETERS channel="{channel}" bitrate="{bitrate}" tseg1="{tseg1}" tseg2="{tseg2}" sjw="{sjw}" silent="YES"/>"#,
             channel = channel.channel,
             bitrate = channel.bitrate.as_bps(),
         ));
@@ -1457,13 +1464,13 @@ fn build_log_all_xml(channels: &[LoggerCanChannelConfig]) -> Result<String> {
     }
 
     Ok(format!(
-        r#"<?xml version="1.0"?>
+        r#"<?xml version="1.0" encoding="utf-8"?>
 <KVASER>
   <VERSION>2.0</VERSION>
   <BINARY_VERSION>6.0</BINARY_VERSION>
   <SETTINGS>
-    <MODE log_all="YES" fifo_mode="NO"/>
-    <CANPOWER timeout="30000"/>
+    <MODE log_all="YES" fifo_mode="YES"/>
+    <CANPOWER timeout="0"/>
   </SETTINGS>
   <CAN_BUS>
 {can_bus}  </CAN_BUS>
@@ -1482,7 +1489,7 @@ fn build_log_all_xml(channels: &[LoggerCanChannelConfig]) -> Result<String> {
 
 fn logger_timing(bitrate: CanBitrate) -> Result<(u16, u16, u8)> {
     match bitrate {
-        CanBitrate::B500K => Ok((5, 2, 1)),
+        CanBitrate::B500K => Ok((11, 4, 1)),
         CanBitrate::B1M => Ok((5, 2, 1)),
         other => Err(KvaserError::InvalidBitrate(format!(
             "{other}; logger config supports only 500k and 1M"
@@ -1734,22 +1741,74 @@ fn is_kvlc_not_implemented_error(error: &KvaserError, operation: &'static str) -
     )
 }
 
-fn output_part_path(output: &Path, part: u32) -> PathBuf {
+fn output_path_for_segment(
+    output: &Path,
+    reference_unix_time: Option<u32>,
+    part: u32,
+    existing_outputs: &[PathBuf],
+) -> PathBuf {
     if part == 1 {
         return output.to_path_buf();
     }
-
     let parent = output.parent().unwrap_or_else(|| Path::new(""));
-    let stem = output
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("memorator");
+    let stem = reference_unix_time
+        .map(export_base_name)
+        .or_else(|| {
+            output
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| format!("memorator_segment{part}"));
     let ext = output.extension().and_then(|value| value.to_str());
-    let file_name = match ext {
-        Some(ext) if !ext.is_empty() => format!("{stem}_part{part}.{ext}"),
-        _ => format!("{stem}_part{part}"),
+    let build_path = |suffix: Option<u32>| {
+        let file_name = match (ext, suffix) {
+            (Some(ext), Some(suffix)) if !ext.is_empty() => format!("{stem}_{suffix}.{ext}"),
+            (Some(ext), None) if !ext.is_empty() => format!("{stem}.{ext}"),
+            (_, Some(suffix)) => format!("{stem}_{suffix}"),
+            _ => stem.clone(),
+        };
+        parent.join(file_name)
     };
-    parent.join(file_name)
+
+    let mut candidate = build_path(None);
+    let mut suffix = 2_u32;
+    while candidate.exists() || existing_outputs.iter().any(|path| path == &candidate) {
+        candidate = build_path(Some(suffix));
+        suffix += 1;
+    }
+    candidate
+}
+
+fn export_base_name(unix_ts: u32) -> String {
+    let mut tm = libc::tm {
+        tm_sec: 0,
+        tm_min: 0,
+        tm_hour: 0,
+        tm_mday: 0,
+        tm_mon: 0,
+        tm_year: 0,
+        tm_wday: 0,
+        tm_yday: 0,
+        tm_isdst: 0,
+        tm_gmtoff: 0,
+        tm_zone: std::ptr::null(),
+    };
+    let seconds = unix_ts as libc::time_t;
+    let result = unsafe { libc::localtime_r(&seconds, &mut tm) };
+    if result.is_null() {
+        return format!("log_{unix_ts}");
+    }
+
+    let year = (tm.tm_year + 1900) % 100;
+    format!(
+        "log_{year:02}_{month:02}_{day:02}-{hour:02}_{min:02}_{sec:02}",
+        month = tm.tm_mon + 1,
+        day = tm.tm_mday,
+        hour = tm.tm_hour,
+        min = tm.tm_min,
+        sec = tm.tm_sec
+    )
 }
 
 fn finalize_converter(converter: Converter, fallback_path: &Path) -> Result<PathBuf> {

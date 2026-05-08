@@ -100,12 +100,27 @@ fn run_logs(command: LogsCommand) -> anyhow::Result<()> {
                 overwrite,
                 &dbc_files,
             )?;
-            println!(
-                "exported {} events from logs {:?} to {}",
-                summary.events,
-                summary.files,
-                summary.output.display()
-            );
+            if summary.outputs.len() <= 1 {
+                println!(
+                    "exported {} events from logs {:?} to {}",
+                    summary.events,
+                    summary.files,
+                    summary.output.display()
+                );
+            } else {
+                println!(
+                    "exported {} events from logs {:?} to {} files: {}",
+                    summary.events,
+                    summary.files,
+                    summary.outputs.len(),
+                    summary
+                        .outputs
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
         }
         LogsCommand::Reset {
             device_channel,

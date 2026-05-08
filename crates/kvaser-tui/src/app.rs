@@ -625,13 +625,9 @@ impl App {
                         self.status = format_export_progress(progress);
                     }
                     ExportMessage::Done(summary) => {
-                        persist_exported_manifest_keys(&self.export_pending_keys, &summary.output);
+                        persist_exported_manifest_keys(&self.export_pending_keys, &summary.outputs);
                         self.export_pending_keys.clear();
-                        self.status = format!(
-                            "exported {} events to {}",
-                            summary.events,
-                            summary.output.display()
-                        );
+                        self.status = format_export_summary(&summary);
                         finished = true;
                     }
                     ExportMessage::Failed(error) => {
@@ -672,6 +668,23 @@ fn format_export_progress(progress: ExportProgress) -> String {
     format!(
         "exporting {}/{} events ({}%)",
         progress.completed_events, progress.total_events, pct
+    )
+}
+
+fn format_export_summary(summary: &ExportSummary) -> String {
+    if summary.outputs.len() <= 1 {
+        return format!(
+            "exported {} events to {}",
+            summary.events,
+            summary.output.display()
+        );
+    }
+
+    format!(
+        "exported {} events to {} (+{} more files)",
+        summary.events,
+        summary.output.display(),
+        summary.outputs.len().saturating_sub(1)
     )
 }
 
@@ -775,19 +788,23 @@ fn load_export_manifest_keys() -> BTreeSet<String> {
         let mut parts = line.splitn(3, '\t');
         let key = parts.next().unwrap_or("").trim();
         let _ts = parts.next().unwrap_or("").trim();
-        let output_path = parts.next().unwrap_or("").trim();
-        if key.is_empty() || output_path.is_empty() {
+        let output_paths = parts.next().unwrap_or("").trim();
+        if key.is_empty() || output_paths.is_empty() {
             continue;
         }
-        if Path::new(output_path).is_file() {
+        if output_paths
+            .split('|')
+            .map(str::trim)
+            .any(|output_path| !output_path.is_empty() && Path::new(output_path).is_file())
+        {
             set.insert(key.to_owned());
         }
     }
     set
 }
 
-fn persist_exported_manifest_keys(keys: &[String], output: &Path) {
-    if keys.is_empty() {
+fn persist_exported_manifest_keys(keys: &[String], outputs: &[PathBuf]) {
+    if keys.is_empty() || outputs.is_empty() {
         return;
     }
     let path = manifest_path();
@@ -797,10 +814,17 @@ fn persist_exported_manifest_keys(keys: &[String], output: &Path) {
 
     let mut existing = load_export_manifest_keys();
     let mut lines_to_append = Vec::new();
-    let output = output.display().to_string();
+    let output_list = outputs
+        .iter()
+        .map(|output| output.display().to_string())
+        .collect::<Vec<_>>()
+        .join("|");
     for key in keys {
         if existing.insert(key.clone()) {
-            lines_to_append.push(format!("{key}\t{}\t{output}\n", current_unix_seconds_u32()));
+            lines_to_append.push(format!(
+                "{key}\t{}\t{output_list}\n",
+                current_unix_seconds_u32()
+            ));
         }
     }
     if lines_to_append.is_empty() {
