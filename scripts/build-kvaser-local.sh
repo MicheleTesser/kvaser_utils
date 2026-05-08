@@ -15,12 +15,15 @@ fi
 
 make -C "$kvaser_dir/linuxcan" canlib
 make -C "$kvaser_dir/kvlibsdk" kvamemolibxml XTRA_CFLAGS="-Wno-error=overloaded-virtual -Wno-error=deprecated-declarations"
-make -C "$kvaser_dir/kvlibsdk" kvmlib
 
-# Kvaser SDK 5.51.461 trips Clang's header-guard warning in kvlclib while the
-# upstream Makefile uses -Werror. Keep the source untouched and only relax that
-# specific warning for the local build.
-make -C "$kvaser_dir/kvlibsdk" kvlclib XTRA_CFLAGS=-Wno-error=header-guard
+# Kvaser SDK 5.51.461 also trips newer GCC/Clang on an unused-but-set local
+# in kvmlib/kvlclib sources while upstream builds with -Werror.
+make -C "$kvaser_dir/kvlibsdk" kvmlib XTRA_CFLAGS="-Wno-error=unused-but-set-variable"
+
+# Kvaser SDK 5.51.461 trips modern compilers on a couple of warnings in
+# kvlclib while the upstream Makefile uses -Werror. Keep the source untouched
+# and only relax those warnings for the local build.
+make -C "$kvaser_dir/kvlibsdk" kvlclib XTRA_CFLAGS="-Wno-error=header-guard -Wno-error=unused-but-set-variable"
 
 echo "Local Kvaser user-space libraries built."
 echo "Use scripts/run-local.sh <command> to run with LD_LIBRARY_PATH configured."

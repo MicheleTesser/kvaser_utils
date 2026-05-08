@@ -40,6 +40,13 @@ scripts/run-local.sh channels
 scripts/run-local.sh tui
 ```
 
+Il binario release prova anche automaticamente questi percorsi libreria, quindi
+puoi avviarlo senza wrapper se le `.so` Kvaser sono li':
+- `./third_party/kvaser/...` dal root del repository
+- `/usr/lib/kvaser_utils`
+- `/usr/local/lib/kvaser_utils`
+- `../lib/kvaser_utils` relativo all'eseguibile
+
 In alternativa puoi caricare le env manualmente:
 
 ```bash
@@ -112,6 +119,13 @@ Oppure direttamente con cargo:
 cargo run -p kvaser-tui -- tui
 ```
 
+Build release diretta:
+
+```bash
+cargo build --release -p kvaser-tui
+./target/release/kvaser-tui tui
+```
+
 Tasti principali TUI:
 - `1`: tab CAN
 - `2`: tab Logs
@@ -139,6 +153,49 @@ Note live tunnel:
 - `scripts/setup-socketcan-tunnel-ifaces.sh`: crea/porta UP `can0`/`can1` (`vcan`)
 - `scripts/disable-kvaser-linuxcan-enable-socketcan.sh`: disattiva LinuxCAN e riattiva `kvaser_usb`
 - `scripts/kvaser-driver-mode.sh`: switch rapido `linuxcan` / `socketcan` / `status`
+- `scripts/kvaser_mode`: wrapper corto per packaging/installazione (`-l`, `-s`, `-t`)
+
+## 4.1 Pacchetto Arch locale (`makepkg -si`)
+
+Dal root del repository:
+
+```bash
+makepkg -si
+```
+
+Il pacchetto installa:
+- `kvaser-tui`
+- `kvaser_mode -l`
+- `kvaser_mode -s`
+- `kvaser_mode -t`
+- `kvaser_socketcan_ifaces`
+
+Il `PKGBUILD` e' pensato anche per una release sorgente scaricata manualmente:
+1. scarica l'archivio release `.tar.gz`
+2. estrailo
+3. entra nella directory estratta
+4. esegui `makepkg -si`
+
+La release sorgente contiene gia':
+- codice Rust
+- `PKGBUILD`
+- archivi SDK Kvaser sotto `third_party/kvaser/*.tar.gz`
+
+Quindi non serve AUR per installarlo da una release.
+
+## 4.2 Creazione archivio release
+
+Per generare un archivio release distribuibile:
+
+```bash
+scripts/create-release-archive.sh
+```
+
+Output atteso:
+- `dist/kvaser-utils-0.1.0.tar.gz`
+
+Quell'archivio e' quello da caricare in una GitHub Release o da distribuire
+direttamente. Chi lo scarica puo' estrarlo e lanciare `makepkg -si`.
 
 ## 5) Tutti i comandi CLI
 
