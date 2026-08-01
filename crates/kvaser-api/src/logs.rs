@@ -1,9 +1,12 @@
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CString, c_void};
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::raw::{c_char, c_long, c_uint};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use libloading::Library;
@@ -53,8 +56,10 @@ const KVLC_PROPERTY_OVERWRITE: u32 = 28;
 const KVLC_PROPERTY_SIGNAL_BASED: u32 = 1001;
 
 const KVADB_OK: i32 = 0;
+const KVADB_ERR_DB_FILE_PARSE: i32 = -15;
 const KVAXML_OK: i32 = 0;
 const PARAM_FILE_SIZE: usize = 320 * 32 * 1024;
+static DBC_TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 type KvmStatus = i32;
 type KvmHandle = *mut c_void;
@@ -99,6 +104,7 @@ type KvaDbCreate = unsafe extern "C" fn(KvaDbHnd, *const c_char, *const c_char) 
 type KvaDbReadFile = unsafe extern "C" fn(KvaDbHnd, *const c_char) -> KvaDbStatus;
 type KvaDbClose = unsafe extern "C" fn(KvaDbHnd) -> KvaDbStatus;
 type KvaDbGetErrorText = unsafe extern "C" fn(KvaDbStatus, *mut c_char, usize) -> KvaDbStatus;
+type KvaDbGetLastParseError = unsafe extern "C" fn(*mut c_char, *mut c_uint) -> KvaDbStatus;
 
 type KvaXmlInitialize = unsafe extern "C" fn() -> KvaXmlStatus;
 type KvaXmlGetLastError =
@@ -645,9 +651,12 @@ impl MemoratorDevice {
         });
         for dbc in &ordered_dbc {
             let mut added = false;
+            let prepared_dbc = PreparedDbcFile::new(&dbc.path)?;
 
             if let Some(kvadblib) = self.kvadblib.clone() {
-                match with_silenced_stdio(|| kvadblib.open_database_file(&dbc.path)) {
+                match with_silenced_stdio(|| {
+                    kvadblib.open_database_file(prepared_dbc.path(), &dbc.path)
+                }) {
                     Ok(db_handle) => {
                         match converter.add_database_handle(db_handle, dbc.channel_mask) {
                             Ok(()) => {
@@ -665,13 +674,13 @@ impl MemoratorDevice {
                             }
                         }
                     }
-                    Err(_) => {}
+                    Err(error) => return Err(error),
                 }
             }
 
             if !added {
                 let _ = with_silenced_stdio(|| {
-                    converter.add_database_file(&dbc.path, dbc.channel_mask)
+                    converter.add_database_file(prepared_dbc.path(), dbc.channel_mask)
                 })?;
             }
 
@@ -1167,6 +1176,178 @@ impl Converter {
     }
 }
 
+struct PreparedDbcFile {
+    path: PathBuf,
+    temporary: bool,
+}
+
+impl PreparedDbcFile {
+    fn new(source: &Path) -> Result<Self> {
+        let input = fs::read(source)?;
+        let (contents, changed) = prepare_dbc_contents(&input);
+        if !changed {
+            return Ok(Self {
+                path: source.to_path_buf(),
+                temporary: false,
+            });
+        }
+
+        for _ in 0..100 {
+            let sequence = DBC_TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "kvaser-utils-{}-{sequence}.dbc",
+                std::process::id()
+            ));
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut file) => {
+                    if let Err(error) = file.write_all(&contents) {
+                        drop(file);
+                        let _ = fs::remove_file(&path);
+                        return Err(error.into());
+                    }
+                    return Ok(Self {
+                        path,
+                        temporary: true,
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate a temporary DBC file",
+        )
+        .into())
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for PreparedDbcFile {
+    fn drop(&mut self) {
+        if self.temporary {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn prepare_dbc_contents(input: &[u8]) -> (Vec<u8>, bool) {
+    let lines: Vec<&[u8]> = input.split_inclusive(|byte| *byte == b'\n').collect();
+    let mut value_tables = HashMap::<Vec<u8>, Vec<u8>>::new();
+    let mut message_ids = HashSet::<Vec<u8>>::new();
+
+    for line in &lines {
+        let (body, _) = split_dbc_line(line);
+        let tokens: Vec<&[u8]> = body
+            .split(|byte| byte.is_ascii_whitespace())
+            .filter(|token| !token.is_empty())
+            .collect();
+        if tokens.first() == Some(&b"BO_".as_slice()) {
+            if let Some(id) = tokens.get(1) {
+                message_ids.insert((*id).to_vec());
+            }
+        }
+        if let Some((name, values)) = parse_dbc_value_table(body) {
+            value_tables.insert(name.to_vec(), values.to_vec());
+        }
+    }
+
+    let mut output = Vec::with_capacity(input.len());
+    let mut changed = false;
+    for line in lines {
+        let (body, ending) = split_dbc_line(line);
+        let tokens: Vec<&[u8]> = body
+            .split(|byte| byte.is_ascii_whitespace())
+            .filter(|token| !token.is_empty())
+            .collect();
+
+        if let Some(id) = dbc_record_message_id(&tokens) {
+            if !message_ids.contains(id) {
+                changed = true;
+                continue;
+            }
+        }
+
+        if tokens.len() == 4 && tokens[0] == b"VAL_" {
+            let table_token = tokens[3];
+            if table_token.last() == Some(&b';') {
+                let table_name = &table_token[..table_token.len() - 1];
+                if let Some(values) = value_tables.get(table_name) {
+                    output.extend_from_slice(b"VAL_ ");
+                    output.extend_from_slice(tokens[1]);
+                    output.push(b' ');
+                    output.extend_from_slice(tokens[2]);
+                    output.push(b' ');
+                    output.extend_from_slice(values);
+                    output.push(b';');
+                    output.extend_from_slice(ending);
+                    changed = true;
+                    continue;
+                }
+            }
+        }
+
+        output.extend_from_slice(line);
+    }
+
+    (output, changed)
+}
+
+fn split_dbc_line(line: &[u8]) -> (&[u8], &[u8]) {
+    if line.ends_with(b"\r\n") {
+        (&line[..line.len() - 2], &line[line.len() - 2..])
+    } else if line.ends_with(b"\n") {
+        (&line[..line.len() - 1], &line[line.len() - 1..])
+    } else {
+        (line, &[])
+    }
+}
+
+fn parse_dbc_value_table(line: &[u8]) -> Option<(&[u8], &[u8])> {
+    let mut rest = trim_ascii_start(line);
+    rest = rest.strip_prefix(b"VAL_TABLE_")?;
+    rest = trim_ascii_start(rest);
+    let name_end = rest.iter().position(|byte| byte.is_ascii_whitespace())?;
+    let name = &rest[..name_end];
+    let values = trim_ascii(&rest[name_end..]);
+    if values.last() != Some(&b';') {
+        return None;
+    }
+    Some((name, trim_ascii(&values[..values.len() - 1])))
+}
+
+fn trim_ascii_start(mut value: &[u8]) -> &[u8] {
+    while value.first().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[1..];
+    }
+    value
+}
+
+fn trim_ascii(mut value: &[u8]) -> &[u8] {
+    value = trim_ascii_start(value);
+    while value.last().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[..value.len() - 1];
+    }
+    value
+}
+
+fn dbc_record_message_id<'a>(tokens: &[&'a [u8]]) -> Option<&'a [u8]> {
+    match tokens.first().copied()? {
+        b"BO_TX_BU_" | b"VAL_" | b"SIG_VALTYPE_" | b"SG_MUL_VAL_" | b"SIG_GROUP_" => {
+            tokens.get(1).copied()
+        }
+        b"CM_" | b"BA_" => tokens
+            .iter()
+            .position(|token| *token == b"BO_" || *token == b"SG_")
+            .and_then(|position| tokens.get(position + 1).copied()),
+        _ => None,
+    }
+}
+
 struct Kvadblib {
     _library: Library,
     kva_db_open: KvaDbOpen,
@@ -1174,6 +1355,7 @@ struct Kvadblib {
     kva_db_read_file: KvaDbReadFile,
     kva_db_close: KvaDbClose,
     kva_db_get_error_text: KvaDbGetErrorText,
+    kva_db_get_last_parse_error: Option<KvaDbGetLastParseError>,
 }
 
 impl Kvadblib {
@@ -1194,6 +1376,12 @@ impl Kvadblib {
         let kva_db_close = unsafe { load_symbol(&library, library_name, "kvaDbClose")? };
         let kva_db_get_error_text =
             unsafe { load_symbol(&library, library_name, "kvaDbGetErrorText")? };
+        let kva_db_get_last_parse_error = unsafe {
+            library
+                .get::<KvaDbGetLastParseError>(b"kvaDbGetLastParseError")
+                .ok()
+                .map(|symbol| *symbol)
+        };
 
         Ok(Arc::new(Self {
             _library: library,
@@ -1202,17 +1390,18 @@ impl Kvadblib {
             kva_db_read_file,
             kva_db_close,
             kva_db_get_error_text,
+            kva_db_get_last_parse_error,
         }))
     }
 
-    fn open_database_file(&self, path: &Path) -> Result<KvaDbHnd> {
+    fn open_database_file(&self, path: &Path, source_path: &Path) -> Result<KvaDbHnd> {
         let mut handle = std::ptr::null_mut();
         let status = unsafe { (self.kva_db_open)(&mut handle) };
         self.ensure_status("kvaDbOpen", status)?;
 
         let file = CString::new(path.as_os_str().as_bytes())?;
         let status = if let Some(kva_db_create) = self.kva_db_create {
-            let local_name = path
+            let local_name = source_path
                 .file_stem()
                 .and_then(|value| value.to_str())
                 .unwrap_or("dbc");
@@ -1222,15 +1411,55 @@ impl Kvadblib {
             unsafe { (self.kva_db_read_file)(handle, file.as_ptr()) }
         };
         if status != KVADB_OK {
-            self.close_database_handle(handle);
             let op = if self.kva_db_create.is_some() {
                 "kvaDbCreate"
             } else {
                 "kvaDbReadFile"
             };
-            return Err(self.status_error(op, status));
+            let error = self.database_file_error(op, status, source_path);
+            self.close_database_handle(handle);
+            return Err(error);
         }
         Ok(handle)
+    }
+
+    fn database_file_error(
+        &self,
+        operation: &'static str,
+        status: KvaDbStatus,
+        path: &Path,
+    ) -> KvaserError {
+        let mut message = format!("{}: {}", path.display(), self.error_text(status));
+        if status == KVADB_ERR_DB_FILE_PARSE {
+            if let Some(detail) = self.last_parse_error() {
+                message.push_str(": ");
+                message.push_str(&detail);
+            }
+        }
+        KvaserError::Status {
+            library: KVADBLIB_LABEL,
+            operation,
+            code: status,
+            message,
+        }
+    }
+
+    fn last_parse_error(&self) -> Option<String> {
+        let callback = self.kva_db_get_last_parse_error?;
+        let mut buffer = [0_i8; 1024];
+        let mut length = buffer.len() as c_uint;
+        let status = unsafe { callback(buffer.as_mut_ptr(), &mut length) };
+        if status != KVADB_OK {
+            return None;
+        }
+        let bytes: Vec<u8> = buffer.iter().map(|value| *value as u8).collect();
+        let text = unsafe { c_buffer_to_string(&bytes) };
+        let detail = text
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("Error"))
+            .or_else(|| text.lines().map(str::trim).find(|line| !line.is_empty()))?;
+        Some(detail.to_owned())
     }
 
     fn close_database_handle(&self, handle: KvaDbHnd) {
@@ -1824,4 +2053,43 @@ fn finalize_converter(converter: Converter, fallback_path: &Path) -> Result<Path
         )));
     }
     Ok(output_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prepare_dbc_contents;
+
+    #[test]
+    fn prepares_named_value_tables_and_removes_dangling_records() {
+        let input = b"VAL_TABLE_ STATE 0 \"off\" 1 \"on\";\r\n\
+BO_ 10 Status: 1 ECU\r\n\
+ SG_ state : 0|1@1+ (1,0) [0|1] \"\" ECU\r\n\
+VAL_ 10 state STATE;\r\n\
+BA_ \"GenMsgSendType\" BO_ 99 1;\r\n";
+
+        let (output, changed) = prepare_dbc_contents(input);
+
+        assert!(changed);
+        assert!(
+            output
+                .windows(b"VAL_ 10 state 0 \"off\" 1 \"on\";".len())
+                .any(|window| window == b"VAL_ 10 state 0 \"off\" 1 \"on\";")
+        );
+        assert!(
+            !output
+                .windows(b"BO_ 99".len())
+                .any(|window| window == b"BO_ 99")
+        );
+        assert!(output.ends_with(b"\r\n"));
+    }
+
+    #[test]
+    fn leaves_an_already_compatible_dbc_unchanged() {
+        let input = b"BO_ 10 Status: 1 ECU\nVAL_ 10 state 0 \"off\" 1 \"on\";\n";
+
+        let (output, changed) = prepare_dbc_contents(input);
+
+        assert!(!changed);
+        assert_eq!(output, input);
+    }
 }
