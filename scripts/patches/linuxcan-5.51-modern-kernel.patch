@@ -1,0 +1,12 @@
+diff --git a/common/VCanOsIf.c b/common/VCanOsIf.c
+--- a/common/VCanOsIf.c
++++ b/common/VCanOsIf.c
+@@ -331 +331 @@
+-    strncpy(ci->driver_name, drvData->deviceName, MAX_IOCTL_DRIVER_NAME);
++    strscpy(ci->driver_name, drvData->deviceName, MAX_IOCTL_DRIVER_NAME);
+diff --git a/mhydra/mhydraHWIf.c b/mhydra/mhydraHWIf.c
+--- a/mhydra/mhydraHWIf.c
++++ b/mhydra/mhydraHWIf.c
+@@ -4896 +4896 @@
+-    strncpy(ci->driver_name, vCard->driverData->deviceName, MAX_IOCTL_DRIVER_NAME);
++    strscpy(ci->driver_name, vCard->driverData->deviceName, MAX_IOCTL_DRIVER_NAME);

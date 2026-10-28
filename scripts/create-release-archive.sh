@@ -32,6 +32,9 @@ mkdir -p \
 copy_into_release Cargo.toml
 copy_into_release Cargo.lock
 copy_into_release PKGBUILD
+copy_into_release packaging
+copy_into_release scripts/patches
+copy_into_release scripts/build-packages.sh
 copy_into_release README.md
 copy_into_release rust-toolchain.toml
 copy_into_release export_csv.py

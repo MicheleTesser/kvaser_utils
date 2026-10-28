@@ -3,3 +3,8 @@
 /Cargo.lock
 /third_party/kvaser/linuxcan/
 /third_party/kvaser/kvlibsdk/
+
+/dist/
+/src/
+/pkg/
+/*.pkg.tar.zst

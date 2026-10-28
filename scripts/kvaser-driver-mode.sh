@@ -43,7 +43,10 @@ CONF
 }
 
 clear_linuxcan_persistent() {
-  rm -f "$MODE_FILE"
+  cat >"$MODE_FILE" <<'CONF'
+# Managed by scripts/kvaser-driver-mode.sh; overrides the packaged default.
+blacklist mhydra
+CONF
 }
 
 runtime_status() {
@@ -55,7 +58,7 @@ runtime_status() {
     echo "runtime: unknown (neither mhydra nor kvaser_usb loaded)"
   fi
 
-  if [[ -f "$MODE_FILE" ]]; then
+  if ! grep -qs "^blacklist mhydra$" "$MODE_FILE" && { [[ -f "$MODE_FILE" ]] || [[ -f /usr/lib/modprobe.d/kvaser-linuxcan-mode.conf ]]; }; then
     echo "boot default: linuxcan (kvaser_usb blacklisted by $MODE_FILE)"
   else
     echo "boot default: socketcan (kvaser_usb allowed)"

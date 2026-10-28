@@ -1,0 +1,8 @@
+post_install() {
+  echo 'Kvaser: install the headers matching EACH kernel (linux-headers, linux-lts-headers, linux-cachyos-headers, ...).'
+  echo 'Check dkms status before rebooting. Activate with kvaser_mode -l; start with kvaser-tui tui.'
+  echo 'If migrating from the manual installer, see /usr/share/doc/kvaser-utils/README.md.'
+}
+post_upgrade() {
+  post_install
+}
